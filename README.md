@@ -60,6 +60,7 @@ For Gmail, use an app password instead of your normal account password.
 - `!check` runs an immediate stock check
 - `!links` shows all monitored links with their numbers
 - `!addlink <url>` adds a new monitored link and auto-fetches its title
+- `!addqueue <url>` adds a Pokemon Center queue monitor
 - `!removelink <number>` removes a monitored link by its number from `!links`
 
 `!addlink` and `!removelink` require the Discord `Manage Server` permission.

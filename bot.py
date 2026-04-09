@@ -46,6 +46,7 @@ def env_int(name: str, default: int) -> int:
 class ProductTarget:
     name: str
     url: str
+    mode: str = "stock"
 
 
 @dataclass
@@ -83,7 +84,10 @@ class RestockBot(commands.Bot):
         STATE_FILE.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
 
     def save_targets(self) -> None:
-        payload = [{"name": target.name, "url": target.url} for target in self.targets]
+        payload = [
+            {"name": target.name, "url": target.url, "mode": target.mode}
+            for target in self.targets
+        ]
         TARGETS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     async def setup_hook(self) -> None:
@@ -130,7 +134,7 @@ class RestockBot(commands.Bot):
             if not previous and status.in_stock:
                 updates.append((target, self.build_restock_message(target, status)))
             elif previous and not status.in_stock:
-                logging.info("%s is out of stock again.", target.name)
+                logging.info("%s returned to inactive state.", target.name)
 
         self.save_state()
 
@@ -147,14 +151,20 @@ class RestockBot(commands.Bot):
         async with self.session.get(target.url) as response:
             response.raise_for_status()
             html = await response.text()
+            final_url = str(response.url)
 
         soup = BeautifulSoup(html, "html.parser")
         page_text = soup.get_text(" ", strip=True).lower()
 
         title = self.extract_title(soup) or target.name
-        price = self.extract_price(soup)
-        in_stock = self.detect_in_stock(target.url, soup, html, page_text)
-        summary = self.stock_summary(in_stock)
+        if target.mode == "queue":
+            price = None
+            in_stock = self.detect_queue_open(target.url, final_url, page_text)
+            summary = self.queue_summary(in_stock)
+        else:
+            price = self.extract_price(soup)
+            in_stock = self.detect_in_stock(target.url, soup, html, page_text)
+            summary = self.stock_summary(in_stock)
 
         logging.info("%s checked: %s", target.name, summary)
         return ProductStatus(in_stock=in_stock, title=title, price=price, summary=summary)
@@ -193,7 +203,10 @@ class RestockBot(commands.Bot):
         return lines
 
     def build_target_lines(self) -> List[str]:
-        return [f"{index}. {target.name} | {target.url}" for index, target in enumerate(self.targets, start=1)]
+        return [
+            f"{index}. [{target.mode}] {target.name} | {target.url}"
+            for index, target in enumerate(self.targets, start=1)
+        ]
 
     @staticmethod
     def chunk_lines(lines: List[str], limit: int = 3500) -> List[str]:
@@ -255,6 +268,14 @@ class RestockBot(commands.Bot):
         if in_stock is False:
             return "Sold out"
         return "Unknown"
+
+    @staticmethod
+    def queue_summary(is_open: Optional[bool]) -> str:
+        if is_open is True:
+            return "Queue open"
+        if is_open is False:
+            return "Queue closed"
+        return "Queue status unknown"
 
     @staticmethod
     def collect_availability_values(payload: Any) -> List[str]:
@@ -512,8 +533,53 @@ class RestockBot(commands.Bot):
 
         return None
 
+    @staticmethod
+    def detect_queue_open(
+        requested_url: str,
+        final_url: str,
+        page_text: str,
+    ) -> Optional[bool]:
+        requested_domain = urlparse(requested_url).netloc.lower()
+        final_domain = urlparse(final_url).netloc.lower()
+
+        if "incapsula incident id" in page_text or "request unsuccessful" in page_text:
+            return None
+
+        queue_markers = [
+            "virtual queue",
+            "queue-it",
+            "you are now in line",
+            "you are in line",
+            "estimated wait",
+            "waiting room",
+            "when it is your turn",
+            "your turn will begin",
+            "line is paused",
+        ]
+
+        if final_domain != requested_domain and "queue" in final_domain:
+            return True
+
+        if any(marker in final_url.lower() for marker in ["queue-it", "waitingroom", "queue"]):
+            return True
+
+        if any(marker in page_text for marker in queue_markers):
+            return True
+
+        if "pokemoncenter.com" in requested_domain:
+            return False
+
+        return None
+
     def build_restock_message(self, target: ProductTarget, status: ProductStatus) -> str:
         mention = f"<@&{self.mention_role_id}> " if self.mention_role_id else ""
+        if target.mode == "queue":
+            return (
+                f"{mention}Queue alert for {status.title}!\n"
+                f"Status: {status.summary}\n"
+                f"Link: {target.url}"
+            )
+
         price_line = f"\nPrice: {status.price}" if status.price else ""
         return (
             f"{mention}Restock detected for {status.title}!\n"
@@ -522,6 +588,17 @@ class RestockBot(commands.Bot):
         )
 
     def build_restock_embed(self, target: ProductTarget, status: ProductStatus) -> discord.Embed:
+        if target.mode == "queue":
+            embed = discord.Embed(
+                title="Queue Alert",
+                description=f"**{status.title}** queue is now open.",
+                color=discord.Color.orange(),
+            )
+            embed.add_field(name="Status", value=status.summary, inline=True)
+            embed.add_field(name="Link", value=target.url, inline=False)
+            embed.set_footer(text="Cortis Restock Monitor")
+            return embed
+
         embed = discord.Embed(
             title="Restock Detected",
             description=f"**{status.title}** is available now.",
@@ -594,8 +671,10 @@ class RestockBot(commands.Bot):
             name="Admin Commands | 管理员命令",
             value=(
                 "`!addlink <url>` Add a new monitored link\n"
+                "`!addqueue <url>` Add a Pokemon Center queue monitor\n"
                 "`!removelink <number>` Remove a link by number\n\n"
                 "`!addlink <url>` 添加新的监控链接\n"
+                "`!addqueue <url>` 添加 Pokemon Center 排队监控\n"
                 "`!removelink <编号>` 按编号删除链接"
             ),
             inline=False,
@@ -643,12 +722,12 @@ class RestockBot(commands.Bot):
         self.save_state()
         return updates
 
-    def add_target(self, name: str, url: str) -> bool:
+    def add_target(self, name: str, url: str, mode: str = "stock") -> bool:
         normalized_url = url.strip()
-        if any(target.url == normalized_url for target in self.targets):
+        if any(target.url == normalized_url and target.mode == mode for target in self.targets):
             return False
 
-        self.targets.append(ProductTarget(name=name.strip(), url=normalized_url))
+        self.targets.append(ProductTarget(name=name.strip(), url=normalized_url, mode=mode))
         self.save_targets()
         return True
 
@@ -739,14 +818,17 @@ def default_targets() -> List[ProductTarget]:
             "https://cortisofficial.us/products/greengreen-studio-ver-signed",
         ),
     ]
-    return [ProductTarget(name=name, url=url) for name, url in urls]
+    return [ProductTarget(name=name, url=url, mode="stock") for name, url in urls]
 
 
 def load_targets() -> List[ProductTarget]:
     if not TARGETS_FILE.exists():
         targets = default_targets()
         TARGETS_FILE.write_text(
-            json.dumps([{"name": target.name, "url": target.url} for target in targets], indent=2),
+            json.dumps(
+                [{"name": target.name, "url": target.url, "mode": target.mode} for target in targets],
+                indent=2,
+            ),
             encoding="utf-8",
         )
         return targets
@@ -757,7 +839,10 @@ def load_targets() -> List[ProductTarget]:
         logging.warning("targets.json is invalid. Rebuilding with default targets.")
         targets = default_targets()
         TARGETS_FILE.write_text(
-            json.dumps([{"name": target.name, "url": target.url} for target in targets], indent=2),
+            json.dumps(
+                [{"name": target.name, "url": target.url, "mode": target.mode} for target in targets],
+                indent=2,
+            ),
             encoding="utf-8",
         )
         return targets
@@ -766,13 +851,17 @@ def load_targets() -> List[ProductTarget]:
     for item in raw_targets:
         name = item.get("name")
         url = item.get("url")
+        mode = item.get("mode", "stock")
         if name and url:
-            targets.append(ProductTarget(name=name, url=url))
+            targets.append(ProductTarget(name=name, url=url, mode=mode))
 
     if not targets:
         targets = default_targets()
         TARGETS_FILE.write_text(
-            json.dumps([{"name": target.name, "url": target.url} for target in targets], indent=2),
+            json.dumps(
+                [{"name": target.name, "url": target.url, "mode": target.mode} for target in targets],
+                indent=2,
+            ),
             encoding="utf-8",
         )
     return targets
@@ -868,11 +957,32 @@ def main() -> None:
             logging.exception("Failed to fetch product title for %s", url)
             name = bot.fallback_name_from_url(url)
 
-        if bot.add_target(name=name, url=url):
+        if bot.add_target(name=name, url=url, mode="stock"):
             await ctx.send(f"Added link: {name}\n{url}")
             return
 
         await ctx.send("That link is already being monitored.")
+
+    @bot.command(name="addqueue")
+    async def addqueue_command(ctx: commands.Context, url: str) -> None:
+        if not await ensure_manage_permission(ctx):
+            return
+
+        if not url.startswith("http://") and not url.startswith("https://"):
+            await ctx.send("Please provide a valid URL starting with http:// or https://")
+            return
+
+        parsed_domain = urlparse(url).netloc.lower()
+        if "pokemoncenter.com" not in parsed_domain:
+            await ctx.send("`!addqueue` is currently intended for Pokemon Center queue monitoring.")
+            return
+
+        name = "Pokemon Center Queue"
+        if bot.add_target(name=name, url=url, mode="queue"):
+            await ctx.send(f"Added queue monitor: {name}\n{url}")
+            return
+
+        await ctx.send("That queue monitor is already being tracked.")
 
     @bot.command(name="removelink")
     async def removelink_command(ctx: commands.Context, index: int) -> None:
