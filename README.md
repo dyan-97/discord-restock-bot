@@ -28,7 +28,7 @@ py -m pip install -r requirements.txt
 
 3. Copy `.env.example` to `.env` and fill in your values.
 4. Create a Discord application and bot at [Discord Developer Portal](https://discord.com/developers/applications).
-5. Enable the `MESSAGE CONTENT INTENT` only if you plan to add message commands later. This bot does not require it right now.
+5. Enable the `MESSAGE CONTENT INTENT` in the Discord Developer Portal. This bot uses message commands such as `!status`, `!links`, and `!addlink`.
 6. Invite the bot to your server with permissions to `View Channels` and `Send Messages`.
 7. Run the bot:
 
