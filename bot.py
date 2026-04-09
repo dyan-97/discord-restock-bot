@@ -6,7 +6,8 @@ import re
 from dataclasses import dataclass
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
@@ -49,7 +50,7 @@ class ProductTarget:
 
 @dataclass
 class ProductStatus:
-    in_stock: bool
+    in_stock: Optional[bool]
     title: str
     price: Optional[str]
     summary: str
@@ -115,10 +116,15 @@ class RestockBot(commands.Bot):
             status = await self.fetch_product_status(target)
             self.latest_statuses[target.url] = status
             previous = self.state.get(target.url)
-            self.state[target.url] = status.in_stock
+            if status.in_stock is not None:
+                self.state[target.url] = status.in_stock
 
             if previous is None:
-                logging.info("Initial state for %s set to %s", target.name, status.in_stock)
+                logging.info("Initial state for %s set to %s", target.name, status.summary)
+                continue
+
+            if status.in_stock is None:
+                logging.info("%s availability is unknown for this check.", target.name)
                 continue
 
             if not previous and status.in_stock:
@@ -147,8 +153,8 @@ class RestockBot(commands.Bot):
 
         title = self.extract_title(soup) or target.name
         price = self.extract_price(soup)
-        in_stock = self.detect_in_stock(page_text)
-        summary = "In stock" if in_stock else "Sold out"
+        in_stock = self.detect_in_stock(target.url, soup, html, page_text)
+        summary = self.stock_summary(in_stock)
 
         logging.info("%s checked: %s", target.name, summary)
         return ProductStatus(in_stock=in_stock, title=title, price=price, summary=summary)
@@ -229,29 +235,273 @@ class RestockBot(commands.Bot):
     @staticmethod
     def extract_price(soup: BeautifulSoup) -> Optional[str]:
         for selector in [
+            'meta[property="product:price:amount"]',
+            'meta[itemprop="price"]',
             '[data-product-price]',
             '.price-item--regular',
             '.price',
         ]:
             node = soup.select_one(selector)
             if node:
-                text = node.get_text(" ", strip=True)
+                text = node.get("content") or node.get_text(" ", strip=True)
                 if text:
                     return text
         return None
 
     @staticmethod
-    def detect_in_stock(page_text: str) -> bool:
+    def stock_summary(in_stock: Optional[bool]) -> str:
+        if in_stock is True:
+            return "In stock"
+        if in_stock is False:
+            return "Sold out"
+        return "Unknown"
+
+    @staticmethod
+    def collect_availability_values(payload: Any) -> List[str]:
+        values: List[str] = []
+
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if key.lower() == "availability":
+                    if isinstance(value, str):
+                        values.append(value)
+                else:
+                    values.extend(RestockBot.collect_availability_values(value))
+        elif isinstance(payload, list):
+            for item in payload:
+                values.extend(RestockBot.collect_availability_values(item))
+
+        return values
+
+    @staticmethod
+    def normalize_availability_token(value: str) -> Optional[bool]:
+        token = value.strip().lower()
+        if not token:
+            return None
+
+        positive_tokens = [
+            "instock",
+            "in stock",
+            "limitedavailability",
+            "limited availability",
+            "preorder",
+            "pre-order",
+        ]
+        negative_tokens = [
+            "outofstock",
+            "out of stock",
+            "soldout",
+            "sold out",
+            "discontinued",
+            "unavailable",
+        ]
+
+        if any(marker in token for marker in positive_tokens):
+            return True
+        if any(marker in token for marker in negative_tokens):
+            return False
+        return None
+
+    @staticmethod
+    def extract_schema_availability(soup: BeautifulSoup, html: str) -> List[str]:
+        values: List[str] = []
+
+        for node in soup.select('[itemprop="availability"]'):
+            value = node.get("href") or node.get("content") or node.get_text(" ", strip=True)
+            if value:
+                values.append(value)
+
+        for script in soup.find_all("script", type="application/ld+json"):
+            raw = script.string or script.get_text()
+            if not raw:
+                continue
+
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            values.extend(RestockBot.collect_availability_values(parsed))
+
+        for match in re.findall(r"schema\.org/([A-Za-z]+)", html, flags=re.IGNORECASE):
+            values.append(match)
+
+        return values
+
+    @staticmethod
+    def extract_json_hint_booleans(html: str, keys: List[str]) -> List[bool]:
+        hints: List[bool] = []
+        for key in keys:
+            pattern = rf'"{re.escape(key)}"\s*:\s*(true|false)'
+            for match in re.findall(pattern, html, flags=re.IGNORECASE):
+                hints.append(match.lower() == "true")
+        return hints
+
+    @staticmethod
+    def detect_target_stock(page_text: str, html: str) -> Optional[bool]:
+        negative_markers = [
+            "out of stock",
+            "temporarily out of stock",
+            "notify me when it's back",
+            "notify me when its back",
+            "sold out",
+        ]
+        positive_markers = [
+            "in stock",
+            "only a few left",
+            "add to cart",
+            "ship it",
+            "same day delivery",
+            "pickup",
+        ]
+
+        if any(marker in page_text for marker in negative_markers):
+            return False
+        if any(marker in page_text for marker in positive_markers):
+            return True
+
+        for hint in RestockBot.extract_json_hint_booleans(
+            html,
+            ["is_out_of_stock", "in_stock", "available_to_promise"],
+        ):
+            return hint
+
+        return None
+
+    @staticmethod
+    def detect_bestbuy_stock(page_text: str, html: str) -> Optional[bool]:
+        negative_markers = [
+            "sold out",
+            "coming soon",
+            "unavailable nearby",
+            "not available for pickup",
+            "not available for shipping",
+            "check stores",
+        ]
+        positive_markers = [
+            "add to cart",
+            "add to basket",
+            "get it by",
+            "shipping",
+            "pickup",
+        ]
+
+        if any(marker in page_text for marker in negative_markers):
+            return False
+        if any(marker in page_text for marker in positive_markers):
+            return True
+
+        for hint in RestockBot.extract_json_hint_booleans(
+            html,
+            ["isSoldOut", "isComingSoon", "isPreOrder", "orderable", "inStock"],
+        ):
+            return hint
+
+        return None
+
+    @staticmethod
+    def detect_pokemoncenter_stock(page_text: str, html: str) -> Optional[bool]:
+        if "incapsula incident id" in page_text or "request unsuccessful" in page_text:
+            return None
+
+        negative_markers = [
+            "sold out",
+            "email me when available",
+            "notify me when available",
+            "out of stock",
+        ]
+        positive_markers = [
+            "add to cart",
+            "add to bag",
+            "quantity",
+        ]
+
+        if any(marker in page_text for marker in negative_markers):
+            return False
+        if any(marker in page_text for marker in positive_markers):
+            return True
+
+        for hint in RestockBot.extract_json_hint_booleans(
+            html,
+            ["inStock", "isInStock", "available"],
+        ):
+            return hint
+
+        return None
+
+    @staticmethod
+    def detect_ikea_stock(page_text: str, html: str) -> Optional[bool]:
+        negative_markers = [
+            "out of stock",
+            "not available for delivery",
+            "not available in store",
+            "sold out",
+        ]
+        positive_markers = [
+            "add to bag",
+            "add to cart",
+            "buy now",
+            "in stock",
+        ]
+
+        if any(marker in page_text for marker in negative_markers):
+            return False
+        if any(marker in page_text for marker in positive_markers):
+            return True
+        if "checking availability" in page_text:
+            return None
+
+        for hint in RestockBot.extract_json_hint_booleans(
+            html,
+            ["inStock", "available", "sellable"],
+        ):
+            return hint
+
+        return None
+
+    @staticmethod
+    def detect_in_stock(
+        url: str,
+        soup: BeautifulSoup,
+        html: str,
+        page_text: str,
+    ) -> Optional[bool]:
+        for value in RestockBot.extract_schema_availability(soup, html):
+            parsed = RestockBot.normalize_availability_token(value)
+            if parsed is not None:
+                return parsed
+
+        domain = urlparse(url).netloc.lower()
+        store_detectors = [
+            ("ikea.com", RestockBot.detect_ikea_stock),
+            ("pokemoncenter.com", RestockBot.detect_pokemoncenter_stock),
+            ("target.com", RestockBot.detect_target_stock),
+            ("bestbuy.com", RestockBot.detect_bestbuy_stock),
+        ]
+        for site, detector in store_detectors:
+            if site in domain:
+                detected = detector(page_text, html)
+                if detected is not None:
+                    return detected
+
         sold_out_markers = [
             "sold out",
             "sorry sold out",
             "out of stock",
             "unavailable",
+            "email me when available",
+            "notify me when available",
+            "notify me when it's back",
+            "temporarily out of stock",
+            "not available",
         ]
         positive_markers = [
             "add to cart",
             "buy it now",
             "pre-order",
+            "add to bag",
+            "available for pickup",
+            "available for shipping",
         ]
 
         if any(marker in page_text for marker in sold_out_markers):
@@ -260,7 +510,7 @@ class RestockBot(commands.Bot):
         if any(marker in page_text for marker in positive_markers):
             return True
 
-        return False
+        return None
 
     def build_restock_message(self, target: ProductTarget, status: ProductStatus) -> str:
         mention = f"<@&{self.mention_role_id}> " if self.mention_role_id else ""
@@ -384,9 +634,10 @@ class RestockBot(commands.Bot):
             status = await self.fetch_product_status(target)
             self.latest_statuses[target.url] = status
             previous = self.state.get(target.url)
-            self.state[target.url] = status.in_stock
+            if status.in_stock is not None:
+                self.state[target.url] = status.in_stock
 
-            if previous is not None and not previous and status.in_stock:
+            if previous is not None and status.in_stock is True and not previous:
                 updates.append((target, self.build_restock_message(target, status)))
 
         self.save_state()
