@@ -15,6 +15,7 @@ This bot watches three Cortis product pages and sends a Discord message when one
 - Sends a notification to one Discord channel
 - Optionally sends an email alert
 - Stores the last known stock state in `state.json` so it does not spam repeat alerts
+- Lets you view, add, and remove monitored links from Discord
 
 ## Setup
 
@@ -53,6 +54,16 @@ For Gmail, use an app password instead of your normal account password.
 - On April 8, 2026, all three watched pages showed `Sold out`.
 - The first run records the current state without sending alerts. Alerts start on later checks when a product changes from sold out to in stock.
 
+## Discord commands
+
+- `!status` shows the latest known stock status for all monitored products
+- `!check` runs an immediate stock check
+- `!links` shows all monitored links with their numbers
+- `!addlink <url>` adds a new monitored link and auto-fetches its title
+- `!removelink <number>` removes a monitored link by its number from `!links`
+
+`!addlink` and `!removelink` require the Discord `Manage Server` permission.
+
 ## Deploy On Railway
 
 1. Push this project to GitHub.
@@ -80,6 +91,7 @@ EMAIL_TO=
 
 ```text
 STATE_FILE_PATH=/data/state.json
+TARGETS_FILE_PATH=/data/targets.json
 ```
 
-This keeps the bot's stock cache after redeploys or restarts.
+This keeps the bot's stock cache and monitored links after redeploys or restarts.

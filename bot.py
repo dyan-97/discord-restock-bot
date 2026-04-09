@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from email.message import EmailMessage
 from pathlib import Path
@@ -16,6 +17,7 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = Path(os.getenv("STATE_FILE_PATH", str(BASE_DIR / "state.json")))
+TARGETS_FILE = Path(os.getenv("TARGETS_FILE_PATH", str(BASE_DIR / "targets.json")))
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -62,6 +64,7 @@ class RestockBot(commands.Bot):
         self.check_interval = env_int("CHECK_INTERVAL_SECONDS", 300)
         self.mention_role_id = os.getenv("DISCORD_MENTION_ROLE_ID")
         self.state = self.load_state()
+        self.latest_statuses: Dict[str, ProductStatus] = {}
         self.session: Optional[aiohttp.ClientSession] = None
 
     def load_state(self) -> Dict[str, bool]:
@@ -76,6 +79,10 @@ class RestockBot(commands.Bot):
 
     def save_state(self) -> None:
         STATE_FILE.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
+
+    def save_targets(self) -> None:
+        payload = [{"name": target.name, "url": target.url} for target in self.targets]
+        TARGETS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     async def setup_hook(self) -> None:
         timeout = aiohttp.ClientTimeout(total=30)
@@ -101,10 +108,11 @@ class RestockBot(commands.Bot):
             await asyncio.sleep(self.check_interval)
 
     async def check_all_products(self) -> None:
-        updates: List[str] = []
+        updates: List[tuple[ProductTarget, str]] = []
 
         for target in self.targets:
             status = await self.fetch_product_status(target)
+            self.latest_statuses[target.url] = status
             previous = self.state.get(target.url)
             self.state[target.url] = status.in_stock
 
@@ -113,15 +121,16 @@ class RestockBot(commands.Bot):
                 continue
 
             if not previous and status.in_stock:
-                updates.append(self.build_restock_message(target, status))
+                updates.append((target, self.build_restock_message(target, status)))
             elif previous and not status.in_stock:
                 logging.info("%s is out of stock again.", target.name)
 
         self.save_state()
 
         if updates:
-            for message in updates:
-                await self.send_discord_alert(message)
+            for target, message in updates:
+                embed = self.build_restock_embed(target, self.latest_statuses[target.url])
+                await self.send_discord_alert(message, embed=embed)
                 await self.send_email_alert("Restock detected", message)
 
     async def fetch_product_status(self, target: ProductTarget) -> ProductStatus:
@@ -143,12 +152,54 @@ class RestockBot(commands.Bot):
         logging.info("%s checked: %s", target.name, summary)
         return ProductStatus(in_stock=in_stock, title=title, price=price, summary=summary)
 
+    async def fetch_product_title(self, url: str) -> str:
+        if self.session is None:
+            raise RuntimeError("HTTP session is not initialized")
+
+        async with self.session.get(url) as response:
+            response.raise_for_status()
+            html = await response.text()
+
+        soup = BeautifulSoup(html, "html.parser")
+        title = self.extract_title(soup)
+        if title:
+            return title
+
+        title_tag = soup.find("title")
+        if title_tag:
+            text = title_tag.get_text(strip=True)
+            if text:
+                return text
+
+        return self.fallback_name_from_url(url)
+
+    def build_status_lines(self) -> List[str]:
+        lines: List[str] = []
+        for index, target in enumerate(self.targets, start=1):
+            status = self.latest_statuses.get(target.url)
+            if status is None:
+                lines.append(f"{index}. {target.name}: no data yet")
+                continue
+
+            price = f" | Price: {status.price}" if status.price else ""
+            lines.append(f"{index}. {status.title}: {status.summary}{price}")
+        return lines
+
+    def build_target_lines(self) -> List[str]:
+        return [f"{index}. {target.name} | {target.url}" for index, target in enumerate(self.targets, start=1)]
+
     @staticmethod
     def extract_title(soup: BeautifulSoup) -> Optional[str]:
         heading = soup.find("h1")
         if heading:
             return heading.get_text(strip=True)
         return None
+
+    @staticmethod
+    def fallback_name_from_url(url: str) -> str:
+        slug = url.rstrip("/").split("/")[-1]
+        slug = re.sub(r"[-_]+", " ", slug).strip()
+        return slug.title() if slug else "Untitled Product"
 
     @staticmethod
     def extract_price(soup: BeautifulSoup) -> Optional[str]:
@@ -195,14 +246,132 @@ class RestockBot(commands.Bot):
             f"Link: {target.url}"
         )
 
-    async def send_startup_message(self) -> None:
-        message = (
-            "Restock bot is online and monitoring 3 products.\n"
-            f"Check interval: {self.check_interval} seconds."
+    def build_restock_embed(self, target: ProductTarget, status: ProductStatus) -> discord.Embed:
+        embed = discord.Embed(
+            title="Restock Detected",
+            description=f"**{status.title}** is available now.",
+            color=discord.Color.green(),
         )
-        await self.send_discord_alert(message)
+        embed.add_field(name="Status", value=status.summary, inline=True)
+        embed.add_field(name="Price", value=status.price or "Unknown", inline=True)
+        embed.add_field(name="Link", value=target.url, inline=False)
+        embed.set_footer(text="Cortis Restock Monitor")
+        return embed
 
-    async def send_discord_alert(self, message: str) -> None:
+    def build_status_embed(self, title: str, description: str, color: discord.Color) -> discord.Embed:
+        embed = discord.Embed(title=title, description=description, color=color)
+        embed.set_footer(text="Cortis Restock Monitor")
+        return embed
+
+    def build_links_embed(self) -> discord.Embed:
+        description = "\n".join(self.build_target_lines()) or "No monitored links yet."
+        embed = discord.Embed(
+            title="Monitored Links",
+            description=description,
+            color=discord.Color.gold(),
+        )
+        embed.set_footer(text="Cortis Restock Monitor")
+        return embed
+
+    async def send_startup_message(self) -> None:
+        embed = discord.Embed(
+            title="Restock Bot Tutorial | 使用教程",
+            description=(
+                "Use the commands below to check stock and manage monitored links.\n"
+                "使用下面的命令查看库存和管理监控链接。\n\n"
+                f"Currently monitoring **{len(self.targets)}** products.\n"
+                f"当前监控商品数量：**{len(self.targets)}**\n"
+                f"Check interval / 检查间隔：**{self.check_interval}** seconds"
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="User Commands | 普通命令",
+            value=(
+                "`!status` Show latest stock status\n"
+                "`!check` Run an immediate stock check\n"
+                "`!links` Show all monitored links\n\n"
+                "`!status` 查看当前库存状态\n"
+                "`!check` 立即手动检查一次\n"
+                "`!links` 查看当前监控链接"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Admin Commands | 管理员命令",
+            value=(
+                "`!addlink <url>` Add a new monitored link\n"
+                "`!removelink <number>` Remove a link by number\n\n"
+                "`!addlink <url>` 添加新的监控链接\n"
+                "`!removelink <编号>` 按编号删除链接"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Permissions | 权限说明",
+            value=(
+                "`!addlink` and `!removelink` require `Manage Server` permission.\n"
+                "`!addlink` 和 `!removelink` 需要 `Manage Server` 权限。"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Restock Alert Example | 补货提醒示例",
+            value=(
+                "When an item restocks, the bot posts a green alert card with:\n"
+                "- product name\n"
+                "- stock status\n"
+                "- price\n"
+                "- product link\n\n"
+                "商品补货时，机器人会发送绿色提醒卡片，包含：\n"
+                "- 商品名称\n"
+                "- 库存状态\n"
+                "- 价格\n"
+                "- 商品链接"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="Cortis Restock Monitor")
+        await self.send_discord_alert("", embed=embed)
+
+    async def manual_check(self) -> List[tuple[ProductTarget, str]]:
+        updates: List[tuple[ProductTarget, str]] = []
+
+        for target in self.targets:
+            status = await self.fetch_product_status(target)
+            self.latest_statuses[target.url] = status
+            previous = self.state.get(target.url)
+            self.state[target.url] = status.in_stock
+
+            if previous is not None and not previous and status.in_stock:
+                updates.append((target, self.build_restock_message(target, status)))
+
+        self.save_state()
+        return updates
+
+    def add_target(self, name: str, url: str) -> bool:
+        normalized_url = url.strip()
+        if any(target.url == normalized_url for target in self.targets):
+            return False
+
+        self.targets.append(ProductTarget(name=name.strip(), url=normalized_url))
+        self.save_targets()
+        return True
+
+    def remove_target(self, index: int) -> ProductTarget:
+        target = self.targets.pop(index)
+        self.latest_statuses.pop(target.url, None)
+        self.state.pop(target.url, None)
+        self.save_targets()
+        self.save_state()
+        return target
+
+    async def send_discord_alert(
+        self,
+        message: str,
+        *,
+        embed: Optional[discord.Embed] = None,
+    ) -> None:
         channel = self.get_channel(self.channel_id)
         if channel is None:
             channel = await self.fetch_channel(self.channel_id)
@@ -210,7 +379,7 @@ class RestockBot(commands.Bot):
         if not isinstance(channel, discord.abc.Messageable):
             raise TypeError("Configured Discord channel is not messageable")
 
-        await channel.send(message)
+        await channel.send(content=message or None, embed=embed)
         logging.info("Discord alert sent.")
 
     async def send_email_alert(self, subject: str, body: str) -> None:
@@ -261,7 +430,7 @@ class RestockBot(commands.Bot):
             server.send_message(message)
 
 
-def load_targets() -> List[ProductTarget]:
+def default_targets() -> List[ProductTarget]:
     urls = [
         (
             "GREENGREEN (BRIDGE ver.) (Signed)",
@@ -277,6 +446,42 @@ def load_targets() -> List[ProductTarget]:
         ),
     ]
     return [ProductTarget(name=name, url=url) for name, url in urls]
+
+
+def load_targets() -> List[ProductTarget]:
+    if not TARGETS_FILE.exists():
+        targets = default_targets()
+        TARGETS_FILE.write_text(
+            json.dumps([{"name": target.name, "url": target.url} for target in targets], indent=2),
+            encoding="utf-8",
+        )
+        return targets
+
+    try:
+        raw_targets = json.loads(TARGETS_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        logging.warning("targets.json is invalid. Rebuilding with default targets.")
+        targets = default_targets()
+        TARGETS_FILE.write_text(
+            json.dumps([{"name": target.name, "url": target.url} for target in targets], indent=2),
+            encoding="utf-8",
+        )
+        return targets
+
+    targets: List[ProductTarget] = []
+    for item in raw_targets:
+        name = item.get("name")
+        url = item.get("url")
+        if name and url:
+            targets.append(ProductTarget(name=name, url=url))
+
+    if not targets:
+        targets = default_targets()
+        TARGETS_FILE.write_text(
+            json.dumps([{"name": target.name, "url": target.url} for target in targets], indent=2),
+            encoding="utf-8",
+        )
+    return targets
 
 
 def main() -> None:
@@ -295,6 +500,84 @@ def main() -> None:
         raise RuntimeError("DISCORD_CHANNEL_ID is missing from your environment.")
 
     bot = RestockBot(load_targets())
+
+    async def ensure_manage_permission(ctx: commands.Context) -> bool:
+        if isinstance(ctx.author, discord.Member) and ctx.author.guild_permissions.manage_guild:
+            return True
+
+        await ctx.send("You need the `Manage Server` permission to manage monitored links.")
+        return False
+
+    @bot.command(name="status")
+    async def status_command(ctx: commands.Context) -> None:
+        if not bot.latest_statuses:
+            embed = bot.build_status_embed(
+                "No Product Data Yet",
+                "Wait for the next scheduled check or run `!check`.",
+                discord.Color.orange(),
+            )
+            await ctx.send(embed=embed)
+            return
+
+        lines = "\n".join(bot.build_status_lines())
+        embed = bot.build_status_embed("Current Product Status", lines, discord.Color.blurple())
+        await ctx.send(embed=embed)
+
+    @bot.command(name="check")
+    async def check_command(ctx: commands.Context) -> None:
+        progress_embed = bot.build_status_embed(
+            "Manual Check Started",
+            "Running a manual stock check now...",
+            discord.Color.orange(),
+        )
+        await ctx.send(embed=progress_embed)
+        updates = await bot.manual_check()
+        lines = "\n".join(bot.build_status_lines())
+        result_embed = bot.build_status_embed("Manual Check Finished", lines, discord.Color.blurple())
+        await ctx.send(embed=result_embed)
+
+        for target, message in updates:
+            embed = bot.build_restock_embed(target, bot.latest_statuses[target.url])
+            await bot.send_discord_alert(message, embed=embed)
+            await bot.send_email_alert("Restock detected", message)
+
+    @bot.command(name="links")
+    async def links_command(ctx: commands.Context) -> None:
+        await ctx.send(embed=bot.build_links_embed())
+
+    @bot.command(name="addlink")
+    async def addlink_command(ctx: commands.Context, url: str) -> None:
+        if not await ensure_manage_permission(ctx):
+            return
+
+        if not url.startswith("http://") and not url.startswith("https://"):
+            await ctx.send("Please provide a valid URL starting with http:// or https://")
+            return
+
+        try:
+            name = await bot.fetch_product_title(url)
+        except Exception:
+            logging.exception("Failed to fetch product title for %s", url)
+            name = bot.fallback_name_from_url(url)
+
+        if bot.add_target(name=name, url=url):
+            await ctx.send(f"Added link: {name}\n{url}")
+            return
+
+        await ctx.send("That link is already being monitored.")
+
+    @bot.command(name="removelink")
+    async def removelink_command(ctx: commands.Context, index: int) -> None:
+        if not await ensure_manage_permission(ctx):
+            return
+
+        if index < 1 or index > len(bot.targets):
+            await ctx.send("Invalid link number. Use `!links` to see the current list.")
+            return
+
+        removed = bot.remove_target(index - 1)
+        await ctx.send(f"Removed link: {removed.name}\n{removed.url}")
+
     bot.run(token)
 
 
