@@ -190,6 +190,30 @@ class RestockBot(commands.Bot):
         return [f"{index}. {target.name} | {target.url}" for index, target in enumerate(self.targets, start=1)]
 
     @staticmethod
+    def chunk_lines(lines: List[str], limit: int = 3500) -> List[str]:
+        if not lines:
+            return ["No data available."]
+
+        chunks: List[str] = []
+        current: List[str] = []
+        current_len = 0
+
+        for line in lines:
+            line_len = len(line) + 1
+            if current and current_len + line_len > limit:
+                chunks.append("\n".join(current))
+                current = [line]
+                current_len = line_len
+            else:
+                current.append(line)
+                current_len += line_len
+
+        if current:
+            chunks.append("\n".join(current))
+
+        return chunks
+
+    @staticmethod
     def extract_title(soup: BeautifulSoup) -> Optional[str]:
         heading = soup.find("h1")
         if heading:
@@ -273,6 +297,24 @@ class RestockBot(commands.Bot):
         )
         embed.set_footer(text="Cortis Restock Monitor")
         return embed
+
+    def build_paginated_embeds(
+        self,
+        title: str,
+        lines: List[str],
+        color: discord.Color,
+    ) -> List[discord.Embed]:
+        chunks = self.chunk_lines(lines)
+        total = len(chunks)
+        embeds: List[discord.Embed] = []
+
+        for index, chunk in enumerate(chunks, start=1):
+            page_title = title if total == 1 else f"{title} ({index}/{total})"
+            embed = discord.Embed(title=page_title, description=chunk, color=color)
+            embed.set_footer(text="Cortis Restock Monitor")
+            embeds.append(embed)
+
+        return embeds
 
     async def send_startup_message(self) -> None:
         embed = discord.Embed(
@@ -520,9 +562,13 @@ def main() -> None:
             await ctx.send(embed=embed)
             return
 
-        lines = "\n".join(bot.build_status_lines())
-        embed = bot.build_status_embed("Current Product Status", lines, discord.Color.blurple())
-        await ctx.send(embed=embed)
+        embeds = bot.build_paginated_embeds(
+            "Current Product Status",
+            bot.build_status_lines(),
+            discord.Color.blurple(),
+        )
+        for embed in embeds:
+            await ctx.send(embed=embed)
 
     @bot.command(name="check")
     async def check_command(ctx: commands.Context) -> None:
@@ -533,9 +579,13 @@ def main() -> None:
         )
         await ctx.send(embed=progress_embed)
         updates = await bot.manual_check()
-        lines = "\n".join(bot.build_status_lines())
-        result_embed = bot.build_status_embed("Manual Check Finished", lines, discord.Color.blurple())
-        await ctx.send(embed=result_embed)
+        result_embeds = bot.build_paginated_embeds(
+            "Manual Check Finished",
+            bot.build_status_lines(),
+            discord.Color.blurple(),
+        )
+        for embed in result_embeds:
+            await ctx.send(embed=embed)
 
         for target, message in updates:
             embed = bot.build_restock_embed(target, bot.latest_statuses[target.url])
@@ -544,7 +594,13 @@ def main() -> None:
 
     @bot.command(name="links")
     async def links_command(ctx: commands.Context) -> None:
-        await ctx.send(embed=bot.build_links_embed())
+        embeds = bot.build_paginated_embeds(
+            "Monitored Links",
+            bot.build_target_lines(),
+            discord.Color.gold(),
+        )
+        for embed in embeds:
+            await ctx.send(embed=embed)
 
     @bot.command(name="addlink")
     async def addlink_command(ctx: commands.Context, url: str) -> None:
